@@ -144,6 +144,11 @@ public interface DataTableReader {
         ByteBuffer buffer = ByteBuffer.newInstance(estimatedBufferSize, timezone);
         boolean skipped = rowCount > 0;
         while (skipped || nextRow()) {
+            // Detect client disconnect early to stop reading from the source database
+            if (!writer.isOpen()) {
+                break;
+            }
+
             skipped = false;
 
             for (int i = 0; i < length; i++) {

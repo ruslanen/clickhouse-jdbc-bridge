@@ -32,6 +32,8 @@ public class ResponseWriter {
 
     private final long startTime;
 
+    private volatile Runnable cancelAction;
+
     public ResponseWriter(HttpServerResponse response, StreamOptions options, int timeout) {
         this.response = response;
         this.options = options;
@@ -53,6 +55,25 @@ public class ResponseWriter {
 
     public boolean isOpen() {
         return !this.response.closed() && !this.response.ended();
+    }
+
+    public void setCancelAction(Runnable action) {
+        this.cancelAction = action;
+    }
+
+    /**
+     * Idempotent: executes the registered cancel action (if any) exactly once.
+     */
+    public void cancel() {
+        Runnable action = this.cancelAction;
+        if (action != null) {
+            this.cancelAction = null;
+            try {
+                action.run();
+            } catch (Exception e) {
+                log.warn("Failed to execute cancel action", e);
+            }
+        }
     }
 
     public void setDrainHanlder(Handler<Void> handler) {

@@ -48,6 +48,7 @@ public class QueryParser {
     private static final String PARAM_DB_NAME = "db_name";
     private static final String PARAM_TABLE_NAME = "table_name";
     private static final String PARAM_FORMAT_NAME = "format_name";
+    private static final String PARAM_QUERY_ID = "query_id";
 
     private static final String KEYWORD_FROM = "FROM";
 
@@ -70,6 +71,7 @@ public class QueryParser {
     private final String columnsInfo;
     private final String inputFormat;
     private final boolean useNull;
+    private final String queryId;
 
     private final StreamOptions options;
 
@@ -79,13 +81,14 @@ public class QueryParser {
     private TableDefinition columns = null;
 
     protected QueryParser(String uri, String schema, String table, String columnsInfo, String inputFormat,
-            String useNull, MultiMap params) {
+            String useNull, String queryId, MultiMap params) {
         this.uri = uri;
         this.schema = schema;
         this.table = table;
         this.columnsInfo = columnsInfo;
         this.inputFormat = inputFormat;
         this.useNull = Boolean.parseBoolean(useNull);
+        this.queryId = queryId;
         this.options = new StreamOptions(params);
     }
 
@@ -136,6 +139,10 @@ public class QueryParser {
         }
 
         return this.queryParams;
+    }
+
+    public String getQueryId() {
+        return this.queryId;
     }
 
     public String getNormalizedSchema() {
@@ -258,19 +265,78 @@ public class QueryParser {
         return fromRequest(ctx, resolver, false);
     }
 
+    /**
+     * Extracts query_id from connection string and removes it from the URI.
+     * Connection string format: jdbc:postgresql://host:5432/db?user=user&password=pass&query_id=abc123
+     * 
+     * @param uri The connection string (JDBC URL)
+     * @return An array with [cleanedUri, queryId] where queryId may be null
+     */
+    private static String[] extractQueryIdFromConnectionString(String uri) {
+        if (uri == null || uri.isEmpty()) {
+            return new String[] { uri, null };
+        }
+
+        int queryIndex = uri.indexOf('?');
+        if (queryIndex < 0) {
+            return new String[] { uri, null };
+        }
+
+        String baseUri = uri.substring(0, queryIndex + 1);
+        String queryString = uri.substring(queryIndex + 1);
+        
+        StringBuilder cleanedQuery = new StringBuilder();
+        String queryId = null;
+        boolean first = true;
+
+        for (String param : Utils.splitByChar(queryString, '&')) {
+            int eqIndex = param.indexOf('=');
+            if (eqIndex > 0) {
+                String key = param.substring(0, eqIndex);
+                String value = param.substring(eqIndex + 1);
+                
+                if (PARAM_QUERY_ID.equals(key)) {
+                    try {
+                        queryId = URLDecoder.decode(value, "utf-8");
+                    } catch (UnsupportedEncodingException e) {
+                        log.warn("Failed to decode query_id from connection string", e);
+                        queryId = value;
+                    }
+                    continue; // Skip query_id parameter
+                }
+            } else if (PARAM_QUERY_ID.equals(param)) {
+                // query_id without value (shouldn't happen, but handle it)
+                continue;
+            }
+            
+            if (!first) {
+                cleanedQuery.append('&');
+            }
+            cleanedQuery.append(param);
+            first = false;
+        }
+
+        String cleanedUri = cleanedQuery.length() > 0 ? baseUri + cleanedQuery.toString() : uri.substring(0, queryIndex);
+        return new String[] { cleanedUri, queryId };
+    }
+
     public static QueryParser fromRequest(RoutingContext ctx, Repository<NamedDataSource> resolver, boolean forWrite) {
         HttpServerRequest req = Objects.requireNonNull(ctx).request();
 
         final QueryParser query;
 
-        String uri = Objects.requireNonNull(resolver).resolve(req.getParam(PARAM_CONNECTION_STRING));
+        String rawUri = Objects.requireNonNull(resolver).resolve(req.getParam(PARAM_CONNECTION_STRING));
+        String[] uriAndQueryId = extractQueryIdFromConnectionString(rawUri);
+        String uri = uriAndQueryId[0];
+        String queryId = uriAndQueryId[1];
+        
         if (forWrite) {
             String columns = req.getParam(PARAM_SAMPLE_BLOCK);
             if (columns == null) {
                 columns = req.getParam(PARAM_COLUMNS);
             }
             query = new QueryParser(uri, req.getParam(PARAM_DB_NAME), req.getParam(PARAM_TABLE_NAME), columns,
-                    req.getParam(PARAM_FORMAT_NAME), null, null);
+                    req.getParam(PARAM_FORMAT_NAME), null, queryId, req.params());
         } else {
             String schema = req.getParam(PARAM_SCHEMA);
             String table = req.getParam(PARAM_TABLE);
@@ -311,7 +377,7 @@ public class QueryParser {
             }
 
             query = new QueryParser(uri, schema, table, columns, null, req.getParam(PARAM_EXT_TABLE_USE_NULLS),
-                    req.params());
+                    queryId, req.params());
         }
 
         return query;

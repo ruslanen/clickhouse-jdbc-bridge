@@ -23,8 +23,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 
+import com.clickhouse.jdbcbridge.core.ActiveQuery;
 import com.clickhouse.jdbcbridge.core.ByteBuffer;
 import com.clickhouse.jdbcbridge.core.ColumnDefinition;
 import com.clickhouse.jdbcbridge.core.DataType;
@@ -100,6 +102,9 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
     private final RepositoryManager repos;
 
     private long scanInterval = 5000L;
+
+    // Registry for active queries that can be cancelled
+    private final ConcurrentHashMap<String, ActiveQuery> activeQueries = new ConcurrentHashMap<>();
 
     List<Repository<?>> loadRepositories(JsonObject serverConfig) {
         List<Repository<?>> repos = new ArrayList<>();
@@ -265,6 +270,9 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
         // stateless endpoints
         router.get("/ping").handler(requestTimeoutHandler).handler(this::handlePing);
         router.get("/schema_allowed").handler(requestTimeoutHandler).handler(this::handleSchemaAllowed);
+        
+        // Query cancellation endpoint
+        router.delete("/cancel/:queryId").handler(this::handleCancel);
 
         router.post("/identifier_quote").produces(RESPONSE_CONTENT_TYPE).handler(requestTimeoutHandler)
                 .handler(this::handleIdentifierQuote);
@@ -366,6 +374,11 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
         Throwable failure = ctx.failure();
         log.error("Failed to respond", failure);
 
+        HttpServerResponse response = ctx.response();
+        if (response.closed() || response.ended()) {
+            return;
+        }
+
         int statusCode = 500;
         if (failure != null) {
             // Treat query/data access errors as client errors to avoid pointless retries on ClickHouse side.
@@ -378,7 +391,7 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
             }
         }
 
-        ctx.response().setStatusCode(statusCode).end(failure == null ? "Unknown error" : failure.getMessage());
+        response.setStatusCode(statusCode).end(failure == null ? "Unknown error" : failure.getMessage());
     }
 
     private void handlePing(RoutingContext ctx) {
@@ -388,6 +401,34 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
     private void handleSchemaAllowed(RoutingContext ctx) {
         // TODO some datasources do not support schema
         ctx.response().end(SCHEMA_ALLOWED_RESPONSE);
+    }
+
+    private void handleCancel(RoutingContext ctx) {
+        String queryId = ctx.pathParam("queryId");
+        if (queryId == null || queryId.isEmpty()) {
+            ctx.response().setStatusCode(400).end("Missing query_id parameter");
+            return;
+        }
+
+        ActiveQuery activeQuery = activeQueries.get(queryId);
+        if (activeQuery == null) {
+            ctx.response().setStatusCode(404).end("Query not found: " + queryId);
+            return;
+        }
+
+        boolean cancelled = activeQuery.cancel();
+        if (cancelled) {
+            // Remove from registry after successful cancellation
+            activeQueries.remove(queryId);
+            if (log.isDebugEnabled()) {
+                log.debug("Query [{}] cancelled successfully", queryId);
+            }
+            ctx.response().setStatusCode(200).end("Query cancelled: " + queryId);
+        } else {
+            // Already cancelled, but still remove from registry
+            activeQueries.remove(queryId);
+            ctx.response().setStatusCode(200).end("Query already cancelled: " + queryId);
+        }
     }
 
     private NamedDataSource getDataSource(String uri, boolean orCreate) {
@@ -484,6 +525,7 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
         final Repository<NamedDataSource> manager = getDataSourceRepository();
         final QueryParser parser = QueryParser.fromRequest(ctx, manager);
 
+        final HttpServerRequest req = ctx.request();
         final HttpServerResponse resp = ctx.response().setChunked(true);
 
         if (log.isTraceEnabled()) {
@@ -511,48 +553,86 @@ public class JdbcBridgeVerticle extends AbstractVerticle implements ExtensionMan
         ResponseWriter writer = new ResponseWriter(resp, parser.getStreamOptions(),
                 ds.getQueryTimeout(params.getTimeout()));
 
-        long executionStartTime = System.currentTimeMillis();
-        if (namedQuery != null) {
+        // Cancel the JDBC statement when the HTTP connection/response is closed
+        req.connection().closeHandler(v -> writer.cancel());
+        resp.endHandler(v -> writer.cancel());
+        resp.closeHandler(v -> writer.cancel());
+
+        // Register query for cancellation if queryId is provided
+        String queryId = parser.getQueryId();
+        ActiveQuery activeQuery = null;
+        if (queryId != null && !queryId.isEmpty()) {
+            // If queryId already exists, cancel the previous query and replace it
+            ActiveQuery existing = activeQueries.get(queryId);
+            if (existing != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("QueryId [{}] already exists, cancelling previous query", queryId);
+                }
+                existing.cancel();
+            }
+            activeQuery = new ActiveQuery(queryId, writer);
+            activeQueries.put(queryId, activeQuery);
             if (log.isDebugEnabled()) {
-                log.debug("Found named query: [{}]", namedQuery);
+                log.debug("Registered query [{}] for cancellation", queryId);
             }
-
-            if (namedSchema == null) {
-                namedSchema = getSchemaRepository().get(namedQuery.getSchema());
-            }
-            // columns in request might just be a subset of defined list
-            // for example:
-            // - named query 'test' is: select a, b, c from table
-            // - clickhouse query: select b, a from jdbc('?','','test')
-            // - requested columns: b, a
-            ds.executeQuery(rawSchema, namedQuery, namedSchema != null ? namedSchema.getColumns() : parser.getTable(),
-                    params, writer);
-        } else {
-            // columnsInfo could be different from what we responded earlier, so let's parse
-            // it again
-            TableDefinition queryColumns = namedSchema != null ? namedSchema.getColumns() : parser.getTable();
-            // unfortunately default values will be lost between two requests, so we have to
-            // add it back...
-            List<ColumnDefinition> additionalColumns = new ArrayList<ColumnDefinition>();
-            if (params.showDatasourceColumn()) {
-                additionalColumns.add(new ColumnDefinition(TableDefinition.COLUMN_DATASOURCE, DataType.Str, true,
-                        DEFAULT_LENGTH, DEFAULT_PRECISION, DEFAULT_SCALE, null, ds.getId(), null));
-            }
-            if (params.showCustomColumns()) {
-                additionalColumns.addAll(ds.getCustomColumns());
-            }
-
-            queryColumns.updateValues(additionalColumns);
-
-            ds.executeQuery(namedSchema == null ? rawSchema : Utils.EMPTY_STRING, parser.getNormalizedQuery(),
-                    normalizedQuery, queryColumns, params, writer);
         }
 
-        if (log.isDebugEnabled()) {
-            log.debug("Completed execution in {} ms.", System.currentTimeMillis() - executionStartTime);
-        }
+        try {
+            long executionStartTime = System.currentTimeMillis();
+            if (namedQuery != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Found named query: [{}]", namedQuery);
+                }
 
-        resp.end();
+                if (namedSchema == null) {
+                    namedSchema = getSchemaRepository().get(namedQuery.getSchema());
+                }
+                // columns in request might just be a subset of defined list
+                // for example:
+                // - named query 'test' is: select a, b, c from table
+                // - clickhouse query: select b, a from jdbc('?','','test')
+                // - requested columns: b, a
+                ds.executeQuery(rawSchema, namedQuery, namedSchema != null ? namedSchema.getColumns() : parser.getTable(),
+                        params, writer);
+            } else {
+                // columnsInfo could be different from what we responded earlier, so let's parse
+                // it again
+                TableDefinition queryColumns = namedSchema != null ? namedSchema.getColumns() : parser.getTable();
+                // unfortunately default values will be lost between two requests, so we have to
+                // add it back...
+                List<ColumnDefinition> additionalColumns = new ArrayList<ColumnDefinition>();
+                if (params.showDatasourceColumn()) {
+                    additionalColumns.add(new ColumnDefinition(TableDefinition.COLUMN_DATASOURCE, DataType.Str, true,
+                            DEFAULT_LENGTH, DEFAULT_PRECISION, DEFAULT_SCALE, null, ds.getId(), null));
+                }
+                if (params.showCustomColumns()) {
+                    additionalColumns.addAll(ds.getCustomColumns());
+                }
+
+                queryColumns.updateValues(additionalColumns);
+
+                ds.executeQuery(namedSchema == null ? rawSchema : Utils.EMPTY_STRING, parser.getNormalizedQuery(),
+                        normalizedQuery, queryColumns, params, writer);
+            }
+
+            if (log.isDebugEnabled()) {
+                log.debug("Completed execution in {} ms.", System.currentTimeMillis() - executionStartTime);
+            }
+
+            // Guard against double-end: if the TimeoutHandler already ended the response
+            // (via errorHandler), calling resp.end() again would throw.
+            if (writer.isOpen()) {
+                resp.end();
+            }
+        } finally {
+            // Remove query from registry after completion (success or failure)
+            if (queryId != null && !queryId.isEmpty()) {
+                activeQueries.remove(queryId);
+                if (log.isDebugEnabled()) {
+                    log.debug("Removed query [{}] from registry", queryId);
+                }
+            }
+        }
     }
 
     // https://github.com/ClickHouse/ClickHouse/blob/bee5849c6a7dba20dbd24dfc5fd5a786745d90ff/programs/odbc-bridge/MainHandler.cpp#L169
